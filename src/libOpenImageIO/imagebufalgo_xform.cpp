@@ -1383,10 +1383,14 @@ build_axis_map_bilinear(int dst_begin, int dst_end, float dst_full_origin,
 
 
 // Sampling through an AxisMap reads the source with raw row pointers, so it
-// needs the pixels resident and the scanlines unpadded. There is no minimum
-// size: building the maps is O(width + height) against an O(width * height)
-// payoff, but measurement shows even a 22k-pixel destination breaking even, so
-// a size cutoff would add a tuning constant for nothing.
+// needs the pixels resident, the channels and pixels packed within a scanline,
+// and rows a whole number of elements apart. Note that contiguous_scanline()
+// says nothing about the gap between rows, so the maps are built from the
+// actual scanline stride rather than from width * nchannels.
+//
+// There is no minimum size: building the maps is O(width + height) against an
+// O(width * height) payoff, and measurement shows even a 22k-pixel destination
+// breaking even, so a size cutoff would add a tuning constant for nothing.
 // The bilinear map clamps an out of range tap to the source data window, but
 // that is only what WrapClamp does when the data window and the display window
 // coincide. In general WrapClamp folds to the *display* window and anything
@@ -1408,7 +1412,8 @@ axis_map_usable(const ImageBuf& src, const ROI& roi)
 {
     return src.localpixels() && src.contiguous_scanline()
            && src.spec().format.basetype == BaseTypeFromC<SRCTYPE>::value
-           && src.spec().depth == 1 && roi.chend <= src.spec().nchannels;
+           && src.spec().depth == 1 && roi.chend <= src.spec().nchannels
+           && src.scanline_stride() % stride_t(sizeof(SRCTYPE)) == 0;
 }
 
 
@@ -1420,7 +1425,7 @@ resample_nearest(ImageBuf& dst, const ImageBuf& src, ROI roi, int nthreads)
     const ImageSpec& srcspec(src.spec());
     const ImageSpec& dstspec(dst.spec());
     int src_xstride = srcspec.nchannels;
-    int src_ystride = srcspec.width * srcspec.nchannels;
+    int src_ystride = int(src.scanline_stride() / stride_t(sizeof(SRCTYPE)));
 
     // Built here rather than inside the parallel region: the maps depend only
     // on the full windows, so every thread would otherwise rebuild the same
@@ -1478,7 +1483,7 @@ resample_bilinear(ImageBuf& dst, const ImageBuf& src, ROI roi, int nthreads)
     const ImageSpec& srcspec(src.spec());
     const ImageSpec& dstspec(dst.spec());
     int src_xstride = srcspec.nchannels;
-    int src_ystride = srcspec.width * srcspec.nchannels;
+    int src_ystride = int(src.scanline_stride() / stride_t(sizeof(SRCTYPE)));
 
     AxisMap xmap = build_axis_map_bilinear(
         roi.xbegin, roi.xend, float(dstspec.full_x), float(dstspec.full_width),
@@ -1618,7 +1623,8 @@ simd_rgba_usable(const ImageBuf& src, const ImageBuf& dst, const ROI& roi)
     return dst.localpixels() && dst.contiguous_scanline()
            && dst.spec().format.basetype == BaseTypeFromC<DSTTYPE>::value
            && dst.spec().depth == 1 && dst.nchannels() == 4
-           && src.nchannels() == 4 && roi.chbegin == 0 && roi.chend == 4;
+           && src.nchannels() == 4 && roi.chbegin == 0 && roi.chend == 4
+           && dst.scanline_stride() % stride_t(sizeof(DSTTYPE)) == 0;
 }
 
 
@@ -1628,6 +1634,8 @@ resample_nearest_simd(ImageBuf& dst, const ImageBuf& src, ROI roi, int nthreads)
 {
     const ImageSpec& srcspec(src.spec());
     const ImageSpec& dstspec(dst.spec());
+    int src_ystride = int(src.scanline_stride() / stride_t(sizeof(SRCTYPE)));
+    int dst_ystride = int(dst.scanline_stride() / stride_t(sizeof(DSTTYPE)));
     AxisMap xmap = build_axis_map(roi.xbegin, roi.xend, float(dstspec.full_x),
                                   float(dstspec.full_width),
                                   float(srcspec.full_x),
@@ -1637,11 +1645,10 @@ resample_nearest_simd(ImageBuf& dst, const ImageBuf& src, ROI roi, int nthreads)
         = build_axis_map(roi.ybegin, roi.yend, float(dstspec.full_y),
                          float(dstspec.full_height), float(srcspec.full_y),
                          float(srcspec.full_height), srcspec.y,
-                         srcspec.y + srcspec.height, srcspec.width * 4);
+                         srcspec.y + srcspec.height, src_ystride);
 
     const SRCTYPE* srcpixels = (const SRCTYPE*)src.localpixels();
     DSTTYPE* dstpixels       = (DSTTYPE*)dst.localpixels();
-    int dst_ystride          = dstspec.width * 4;
 
     ImageBufAlgo::parallel_image(roi, nthreads, [&](ROI roi) {
         const __m128 black = _mm_setzero_ps();
@@ -1675,6 +1682,8 @@ resample_bilinear_simd(ImageBuf& dst, const ImageBuf& src, ROI roi,
 {
     const ImageSpec& srcspec(src.spec());
     const ImageSpec& dstspec(dst.spec());
+    int src_ystride = int(src.scanline_stride() / stride_t(sizeof(SRCTYPE)));
+    int dst_ystride = int(dst.scanline_stride() / stride_t(sizeof(DSTTYPE)));
     AxisMap xmap = build_axis_map_bilinear(roi.xbegin, roi.xend,
                                            float(dstspec.full_x),
                                            float(dstspec.full_width),
@@ -1684,11 +1693,10 @@ resample_bilinear_simd(ImageBuf& dst, const ImageBuf& src, ROI roi,
     AxisMap ymap = build_axis_map_bilinear(
         roi.ybegin, roi.yend, float(dstspec.full_y), float(dstspec.full_height),
         float(srcspec.full_y), float(srcspec.full_height), srcspec.y,
-        srcspec.y + srcspec.height, srcspec.width * 4);
+        srcspec.y + srcspec.height, src_ystride);
 
     const SRCTYPE* srcpixels = (const SRCTYPE*)src.localpixels();
     DSTTYPE* dstpixels       = (DSTTYPE*)dst.localpixels();
-    int dst_ystride          = dstspec.width * 4;
 
     ImageBufAlgo::parallel_image(roi, nthreads, [&](ROI roi) {
         for (int y = roi.ybegin; y < roi.yend; ++y) {
@@ -1894,6 +1902,16 @@ static bool
 resample_(ImageBuf& dst, const ImageBuf& src, bool interpolate, ROI roi,
           int nthreads)
 {
+#if OIIO_USE_HWY
+    // Interpolating only: resample_hwy() ignores its `interpolate` argument
+    // and always bilerps, so sending nearest here silently returns filtered
+    // pixels instead of the source pixel the caller asked for.
+    if (interpolate && OIIO::pvt::enable_hwy && HwySupports<DSTTYPE>(dst, roi)
+        && HwySupports<SRCTYPE>(src, ROI()))
+        return resample_hwy<DSTTYPE, SRCTYPE>(dst, src, interpolate, roi,
+                                              nthreads);
+#endif
+
     if (OIIO::pvt::enable_resample_axis_map
         && axis_map_usable<SRCTYPE>(src, roi)
         && (!interpolate || data_window_is_full_window(src.spec()))) {
@@ -1912,15 +1930,6 @@ resample_(ImageBuf& dst, const ImageBuf& src, bool interpolate, ROI roi,
                                                                 nthreads);
     }
 
-#if OIIO_USE_HWY
-    // Interpolating only: resample_hwy() ignores its `interpolate` argument
-    // and always bilerps, so sending nearest here silently returns filtered
-    // pixels instead of the source pixel the caller asked for.
-    if (interpolate && OIIO::pvt::enable_hwy && HwySupports<DSTTYPE>(dst, roi)
-        && HwySupports<SRCTYPE>(src, ROI()))
-        return resample_hwy<DSTTYPE, SRCTYPE>(dst, src, interpolate, roi,
-                                              nthreads);
-#endif
 
     return resample_scalar<DSTTYPE, SRCTYPE>(dst, src, interpolate, roi,
                                              nthreads);

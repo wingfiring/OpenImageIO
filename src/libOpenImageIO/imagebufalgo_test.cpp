@@ -893,6 +893,38 @@ test_resample_nearest_equivalence()
             << "  (skipped real-image cases: testsuite/common not found)\n";
     }
 
+    // A source with a gap between scanlines. contiguous_scanline() permits
+    // that -- it only constrains channels and pixels within a row -- so the
+    // maps have to be built from the real scanline stride. Reading it as
+    // width * nchannels lands on the wrong rows entirely, which the flat
+    // gradients above are too smooth to expose.
+    {
+        ImageSpec padspec(97, 61, 4, TypeFloat);
+        stride_t xstride = stride_t(padspec.nchannels * sizeof(float));
+        stride_t ystride = xstride * (padspec.width + 1);
+        std::unique_ptr<char[]> mem(new char[size_t(ystride) * padspec.height]);
+        memset(mem.get(), 0, size_t(ystride) * padspec.height);
+        ImageBuf packed(padspec);
+        for (ImageBuf::Iterator<float> it(packed); !it.done(); ++it)
+            for (int c = 0; c < 4; ++c)
+                it[c] = float(((it.x() * 7 + it.y() * 13 + c) % 71)) / 71.0f;
+        ImageBuf padded(padspec, mem.get(), xstride, ystride);
+        ImageBufAlgo::paste(padded, padspec.x, padspec.y, padspec.z, 0, packed);
+
+        for (bool interp : { false, true }) {
+            ImageSpec dstspec(53, 79, 4, TypeFloat);
+            ImageBuf from_packed(dstspec), from_padded(dstspec);
+            OIIO_CHECK_ASSERT(
+                ImageBufAlgo::resample(from_packed, packed, interp));
+            OIIO_CHECK_ASSERT(
+                ImageBufAlgo::resample(from_padded, padded, interp));
+            OIIO_CHECK_EQUAL(memcmp(from_packed.localpixels(),
+                                    from_padded.localpixels(),
+                                    dstspec.image_bytes()),
+                             0);
+        }
+    }
+
     OIIO::attribute("enable_resample_axis_map", prev);
 }
 
