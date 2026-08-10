@@ -44,6 +44,7 @@ extern OIIO_API int openexr_core;
 extern int jpeg_com_attributes;
 extern int png_linear_premult;
 extern int enable_hwy;
+extern int enable_resample_axis_map;
 extern int limit_channels;
 extern int limit_imagesize_MB;
 extern int limit_resolution;

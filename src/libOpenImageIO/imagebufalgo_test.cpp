@@ -738,6 +738,270 @@ test_zover()
 
 
 
+// One of the shared testsuite images, or an empty buf if the testsuite isn't
+// alongside the binary.
+static ImageBuf
+load_common_image(string_view name)
+{
+    std::string filename = std::string("testsuite/common/") + std::string(name);
+    if (!Filesystem::exists(filename))
+        filename = std::string("../../testsuite/common/") + std::string(name);
+    if (!Filesystem::exists(filename))
+        return ImageBuf();
+    ImageBuf buf(filename);
+    buf.read();
+    return buf;
+}
+
+
+
+// Resample both ways and require the results to be identical byte for byte.
+// enable_hwy is forced off for the duration: it is on by default in builds
+// configured with OIIO_USE_HWY, and it would otherwise service the
+// interpolating baseline, so this would end up comparing the axis map against
+// resample_hwy() instead of against the scalar path it must reproduce.
+static bool
+resample_paths_agree(const ImageBuf& src, const ImageSpec& dstspec,
+                     bool interpolate)
+{
+    int prev_hwy = 0;
+    OIIO::getattribute("enable_hwy", prev_hwy);
+    OIIO::attribute("enable_hwy", 0);
+
+    ImageBuf reference(dstspec);
+    OIIO::attribute("enable_resample_axis_map", 0);
+    bool ok = ImageBufAlgo::resample(reference, src, interpolate);
+
+    ImageBuf candidate(dstspec);
+    OIIO::attribute("enable_resample_axis_map", 1);
+    ok &= ImageBufAlgo::resample(candidate, src, interpolate);
+    if (ok
+        && memcmp(candidate.localpixels(), reference.localpixels(),
+                  dstspec.image_bytes())
+               != 0) {
+        auto cr = ImageBufAlgo::compare(candidate, reference, 0.0f, 0.0f);
+        Strutil::print("    interp={} {}x{} nch={} type={}: maxerror={:g} "
+                       "({} of {} values differ)\n",
+                       int(interpolate), dstspec.width, dstspec.height,
+                       dstspec.nchannels, dstspec.format, cr.maxerror,
+                       cr.nfail,
+                       size_t(dstspec.width) * dstspec.height
+                           * dstspec.nchannels);
+        ok = false;
+    }
+
+    OIIO::attribute("enable_hwy", prev_hwy);
+    return ok;
+}
+
+
+
+// Both sampling modes, so the bilinear map is held to the same bar as the
+// nearest one.
+static bool
+resample_paths_agree(const ImageBuf& src, const ImageSpec& dstspec)
+{
+    return resample_paths_agree(src, dstspec, false)
+           && resample_paths_agree(src, dstspec, true);
+}
+
+
+
+// The precomputed axis maps are a pure optimization: they must reproduce the
+// per-pixel mapping they replaced exactly. Checking the two paths against each
+// other rather than against expected values is what makes that a regression
+// test -- a tolerance-based image compare would hide a one-pixel shift, which
+// is precisely the failure mode a change to the mapping arithmetic causes.
+void
+test_resample_nearest_equivalence()
+{
+    std::cout << "test resample equivalence (nearest + bilinear)\n";
+
+    int prev = 1;
+    OIIO::getattribute("enable_resample_axis_map", prev);
+
+    // Reductions, magnifications, and both non-square directions, over the
+    // types and channel counts that select different sampling paths. The
+    // destinations are deliberately larger than the size cutoff in
+    // axis_map_usable(), or both sides of the comparison would take the same
+    // fallback and the test would prove nothing.
+    for (auto type : { TypeUInt8, TypeUInt16, TypeHalf, TypeFloat }) {
+        for (int nchans : { 1, 3, 4 }) {
+            float top[4]    = { 0.1f, 0.2f, 0.3f, 0.4f };
+            float bottom[4] = { 0.9f, 0.8f, 0.7f, 0.6f };
+            ImageBuf src(ImageSpec(301, 203, nchans, type));
+            ImageBufAlgo::fill(src, cspan<float>(top, nchans),
+                               cspan<float>(bottom, nchans));
+            for (auto wh :
+                 { std::pair<int, int>(199, 211), std::pair<int, int>(601, 409),
+                   std::pair<int, int>(607, 61), std::pair<int, int>(61, 607),
+                   std::pair<int, int>(301, 203) }) {
+                ImageSpec dstspec(wh.first, wh.second, nchans, type);
+                OIIO_CHECK_ASSERT(resample_paths_agree(src, dstspec));
+            }
+        }
+    }
+
+    // A data window that is a crop of the full window: the destination then
+    // has regions mapping outside the source, which is where the nearest map's
+    // valid interval has to line up with the old per-pixel bounds test. The
+    // bilinear half of this case checks the opposite -- that the crop is
+    // declined and handed to the scalar path, since WrapClamp folds to the
+    // display window before deciding whether a tap is black.
+    ImageSpec cropspec(200, 120, 3, TypeFloat);
+    cropspec.x      = 60;
+    cropspec.y      = 40;
+    cropspec.full_x = cropspec.full_y = 0;
+    cropspec.full_width               = 320;
+    cropspec.full_height              = 200;
+    ImageBuf crop(cropspec);
+    float croptop[3]    = { 0.2f, 0.4f, 0.6f };
+    float cropbottom[3] = { 0.7f, 0.5f, 0.3f };
+    ImageBufAlgo::fill(crop, cspan<float>(croptop), cspan<float>(cropbottom));
+    for (auto wh :
+         { std::pair<int, int>(320, 200), std::pair<int, int>(640, 400) })
+        OIIO_CHECK_ASSERT(
+            resample_paths_agree(crop,
+                                 ImageSpec(wh.first, wh.second, 3, TypeFloat)));
+
+    // A real image, so the comparison covers content the synthetic gradients
+    // above cannot produce.
+    ImageBuf tahoe = load_common_image("tahoe-tiny.tif");
+    if (tahoe.initialized()) {
+        int nchans = tahoe.nchannels();
+        for (auto wh :
+             { std::pair<int, int>(320, 240), std::pair<int, int>(640, 480),
+               std::pair<int, int>(517, 163) })
+            OIIO_CHECK_ASSERT(
+                resample_paths_agree(tahoe,
+                                     ImageSpec(wh.first, wh.second, nchans,
+                                               tahoe.spec().format)));
+    } else {
+        std::cout
+            << "  (skipped real-image cases: testsuite/common not found)\n";
+    }
+
+    OIIO::attribute("enable_resample_axis_map", prev);
+}
+
+
+
+// Nearest resampling must pick the same source pixel as the mapping in the
+// OIIO docs, and must be black wherever the destination maps outside the
+// source data window. The crop case below is what distinguishes a data window
+// from a full window, and is not exercised by an ordinary resize.
+void
+test_resample_nearest()
+{
+    std::cout << "test resample nearest\n";
+
+    // Source pixel (x,y) holds the value x + 10*y, so a resampled pixel
+    // identifies exactly which source pixel it came from.
+    const int srcsize = 4;
+    ImageBuf src(ImageSpec(srcsize, srcsize, 1, TypeFloat));
+    for (ImageBuf::Iterator<float> it(src); !it.done(); ++it)
+        it[0] = float(it.x() + 10 * it.y());
+
+    // Both a magnification and a reduction, checked against the mapping
+    // evaluated independently here.
+    for (int dstsize : { 8, 2 }) {
+        ImageBuf dst(ImageSpec(dstsize, dstsize, 1, TypeFloat));
+        OIIO_CHECK_ASSERT(ImageBufAlgo::resample(dst, src, false));
+        for (ImageBuf::ConstIterator<float> it(dst); !it.done(); ++it) {
+            int sx = int((it.x() + 0.5f) / dstsize * srcsize);
+            int sy = int((it.y() + 0.5f) / dstsize * srcsize);
+            OIIO_CHECK_EQUAL(it[0], float(sx + 10 * sy));
+        }
+    }
+
+    // A source whose data window is a 2x2 crop of a 4x4 full window. The
+    // destination covers the whole full window, so its outer half must come
+    // out black rather than clamped or out of bounds.
+    ImageSpec cropspec(2, 2, 1, TypeFloat);
+    cropspec.x = cropspec.y = 1;
+    cropspec.full_x = cropspec.full_y = 0;
+    cropspec.full_width = cropspec.full_height = 4;
+    ImageBuf crop(cropspec);
+    for (ImageBuf::Iterator<float> it(crop); !it.done(); ++it)
+        it[0] = float(it.x() + 10 * it.y());
+
+    ImageBuf dst(ImageSpec(4, 4, 1, TypeFloat));
+    OIIO_CHECK_ASSERT(ImageBufAlgo::resample(dst, crop, false));
+    for (ImageBuf::ConstIterator<float> it(dst); !it.done(); ++it) {
+        bool inside = it.x() >= 1 && it.x() <= 2 && it.y() >= 1 && it.y() <= 2;
+        float expected = inside ? float(it.x() + 10 * it.y()) : 0.0f;
+        OIIO_CHECK_EQUAL(it[0], expected);
+    }
+}
+
+
+
+// Times the same cases through each dispatch branch, selecting the branch
+// explicitly so one run produces the whole comparison. Note the hwy variant
+// also has to switch the axis map off, because resample_() prefers the axis
+// map and would otherwise never reach the Highway code.
+void
+test_resample_variants()
+{
+    std::cout << "test resample variants\n";
+
+    Benchmarker bench;
+    bench.trials(ntrials);
+    bench.iterations(iterations);
+    bench.units(Benchmarker::Unit::us);
+
+    int prev_map = 1, prev_hwy = 0;
+    OIIO::getattribute("enable_resample_axis_map", prev_map);
+    OIIO::getattribute("enable_hwy", prev_hwy);
+
+    ImageBuf src_u8(ImageSpec(1920, 1080, 4, TypeUInt8));
+    ImageBuf src_u16(ImageSpec(1920, 1080, 4, TypeUInt16));
+    ImageBuf src_f(ImageSpec(1920, 1080, 4, TypeFloat));
+    float red[] = { 1.0f, 0.0f, 0.0f, 1.0f };
+    ImageBufAlgo::fill(src_u8, cspan<float>(red));
+    ImageBufAlgo::fill(src_u16, cspan<float>(red));
+    ImageBufAlgo::fill(src_f, cspan<float>(red));
+    ImageBuf dst_u8(ImageSpec(1024, 512, 4, TypeUInt8));
+    ImageBuf dst_u16(ImageSpec(1024, 512, 4, TypeUInt16));
+    ImageBuf dst_f(ImageSpec(1024, 512, 4, TypeFloat));
+
+    struct Variant {
+        const char* tag;
+        int axismap;
+    };
+    // Highway is pinned off throughout: it services the interpolating case
+    // when it is on, and this is meant to time the tables against the
+    // per-pixel path they replaced, not against a third implementation.
+    const Variant variants[] = { { "scalar ", 0 }, { "axismap", 1 } };
+
+    OIIO::attribute("enable_hwy", 0);
+    for (auto&& v : variants) {
+        OIIO::attribute("enable_resample_axis_map", v.axismap);
+        for (int interp = 0; interp <= 1; ++interp) {
+            bool in = interp != 0;
+            bench(Strutil::fmt::format("  [{}] HD->1024x512 u8->u8  interp={}",
+                                       v.tag, interp),
+                  [&]() { ImageBufAlgo::resample(dst_u8, src_u8, in); });
+            bench(Strutil::fmt::format("  [{}] HD->1024x512 u16->u16 interp={}",
+                                       v.tag, interp),
+                  [&]() { ImageBufAlgo::resample(dst_u16, src_u16, in); });
+            bench(Strutil::fmt::format("  [{}] HD->1024x512 f->f    interp={}",
+                                       v.tag, interp),
+                  [&]() { ImageBufAlgo::resample(dst_f, src_f, in); });
+            // Mixed types, where the conversion to and from float is the
+            // whole of the per-channel work the vector path replaces.
+            bench(Strutil::fmt::format("  [{}] HD->1024x512 f->u8   interp={}",
+                                       v.tag, interp),
+                  [&]() { ImageBufAlgo::resample(dst_u8, src_f, in); });
+        }
+    }
+
+    OIIO::attribute("enable_resample_axis_map", prev_map);
+    OIIO::attribute("enable_hwy", prev_hwy);
+}
+
+
+
 // Test ImageBuf::resample
 // resample_hwy() ignores its `interpolate` argument and always bilerps, so
 // nearest sampling has to stay off that path. Highway is off by default, so a
@@ -782,7 +1046,7 @@ test_resample()
     Benchmarker bench;
     bench.trials(ntrials);
     bench.iterations(iterations);
-    bench.units(Benchmarker::Unit::ms);
+    bench.units(Benchmarker::Unit::us);
 
     ImageSpec spec_hd_rgba_f(1920, 1080, 4, TypeFloat);
     ImageSpec spec_hd_rgba_u8(1920, 1080, 4, TypeUInt8);
@@ -805,6 +1069,47 @@ test_resample()
           [&]() { ImageBufAlgo::resample(smallu8, buf_hd_rgba_f, false); });
     bench("  IBA::resample HD->1024x512 rgba u8->u8 no interp ",
           [&]() { ImageBufAlgo::resample(smallu8, buf_hd_rgba_u8, false); });
+
+    // Nearest magnification and a 3-channel u8 reduction: the reduction above
+    // only covers 4-channel destinations that shrink, which hides both the
+    // repeated-source-row case and the odd pixel size.
+    ImageBuf bigu8(ImageSpec(3840, 2160, 4, TypeUInt8));
+    bench("  IBA::resample HD->4K      rgba u8->u8 no interp ",
+          [&]() { ImageBufAlgo::resample(bigu8, buf_hd_rgba_u8, false); });
+    ImageSpec spec_hd_rgb_u8(1920, 1080, 3, TypeUInt8);
+    ImageBuf buf_hd_rgb_u8(spec_hd_rgb_u8);
+    ImageBufAlgo::fill(buf_hd_rgb_u8, red_rgba);
+    ImageBuf smallrgbu8(ImageSpec(1024, 512, 3, TypeUInt8));
+    bench("  IBA::resample HD->1024x512 rgb  u8->u8 no interp ",
+          [&]() { ImageBufAlgo::resample(smallrgbu8, buf_hd_rgb_u8, false); });
+
+    // A real image rather than a flat fill, so the timing reflects a source
+    // the prefetcher cannot trivially predict.
+    ImageBuf tahoe = load_common_image("tahoe-small.tif");
+    if (tahoe.initialized()) {
+        ImageBuf tahoe_down(ImageSpec(tahoe.spec().width / 3,
+                                      tahoe.spec().height / 3,
+                                      tahoe.nchannels(), tahoe.spec().format));
+        bench("  IBA::resample tahoe-small/3            no interp ",
+              [&]() { ImageBufAlgo::resample(tahoe_down, tahoe, false); });
+        ImageBuf tahoe_up(ImageSpec(tahoe.spec().width * 3,
+                                    tahoe.spec().height * 3, tahoe.nchannels(),
+                                    tahoe.spec().format));
+        bench("  IBA::resample tahoe-small*3            no interp ",
+              [&]() { ImageBufAlgo::resample(tahoe_up, tahoe, false); });
+        // Destination sizes bracketing the point where precomputing the maps
+        // starts to pay for itself.
+        for (auto wh :
+             { std::pair<int, int>(256, 192), std::pair<int, int>(384, 288),
+               std::pair<int, int>(512, 384), std::pair<int, int>(768, 576) }) {
+            ImageBuf d(ImageSpec(wh.first, wh.second, tahoe.nchannels(),
+                                 tahoe.spec().format));
+            std::string nm = Strutil::fmt::format(
+                "  IBA::resample tahoe->{}x{} ({}k px)   no interp ", wh.first,
+                wh.second, wh.first * wh.second / 1000);
+            bench(nm, [&]() { ImageBufAlgo::resample(d, tahoe, false); });
+        }
+    }
 }
 
 
@@ -1846,6 +2151,9 @@ main(int argc, char** argv)
     test_over(TypeHalf);
     test_zover();
     test_resample_hwy_nearest();
+    test_resample_nearest();
+    test_resample_nearest_equivalence();
+    test_resample_variants();
     test_resample();
     test_compare();
     test_isConstantColor();

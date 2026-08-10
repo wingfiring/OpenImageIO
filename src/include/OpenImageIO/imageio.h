@@ -3860,6 +3860,13 @@ OIIO_API std::string geterror(bool clear = true);
 ///    at runtime, even if support was enabled when OIIO was built.
 ///    (Added in OIIO 3.2.)
 ///
+/// - `int enable_resample_axis_map' (1)
+///
+///    If nonzero, `ImageBufAlgo::resample()` maps destination pixels to
+///    source pixels using per-axis tables precomputed once per call. Setting
+///    it to zero falls back to evaluating the mapping per pixel, which is
+///    slower but is retained so the two can be compared directly.
+///
 /// - `string plugin_searchpath`
 ///
 ///    Colon-separated (or semicolon-separated) list of directories to search

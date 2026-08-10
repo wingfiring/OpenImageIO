@@ -61,6 +61,10 @@ int enable_hwy = Strutil::stoi(Sysutil::getenv("OPENIMAGEIO_ENABLE_HWY", "0"));
 #else
 int enable_hwy = 0;  // Not enabled at build time
 #endif
+// Selects the precomputed axis-map resampling path. Settable so that a single
+// benchmark run can time it against the per-pixel path it replaced.
+int enable_resample_axis_map = Strutil::stoi(
+    Sysutil::getenv("OPENIMAGEIO_ENABLE_RESAMPLE_AXIS_MAP", "1"));
 int limit_channels(1024);
 int limit_imagesize_MB(std::min(32 * 1024,
                                 int(Sysutil::physical_memory() >> 20)));
@@ -424,6 +428,10 @@ attribute(string_view name, TypeDesc type, const void* val)
 #endif
         return true;
     }
+    if (name == "enable_resample_axis_map" && type == TypeInt) {
+        enable_resample_axis_map = *(const int*)val;
+        return true;
+    }
     if (name == "limits:channels" && type == TypeInt) {
         limit_channels = *(const int*)val;
         return true;
@@ -644,6 +652,10 @@ getattribute(string_view name, TypeDesc type, void* val)
     }
     if (name == "enable_hwy" && type == TypeInt) {
         *(int*)val = enable_hwy;
+        return true;
+    }
+    if (name == "enable_resample_axis_map" && type == TypeInt) {
+        *(int*)val = enable_resample_axis_map;
         return true;
     }
     if (name == "oiio:print_uncaught_errors" && type == TypeInt) {
