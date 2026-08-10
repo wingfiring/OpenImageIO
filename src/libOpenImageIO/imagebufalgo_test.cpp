@@ -772,19 +772,31 @@ resample_paths_agree(const ImageBuf& src, const ImageSpec& dstspec,
     OIIO::attribute("enable_resample_axis_map", 0);
     bool ok = ImageBufAlgo::resample(reference, src, interpolate);
 
-    ImageBuf candidate(dstspec);
-    OIIO::attribute("enable_resample_axis_map", 1);
-    ok &= ImageBufAlgo::resample(candidate, src, interpolate);
-    if (ok
-        && memcmp(candidate.localpixels(), reference.localpixels(),
-                  dstspec.image_bytes())
-               != 0) {
+    // The scalar axis map, then its SSE2 four channel specialization. Both are
+    // checked against the per-pixel path rather than against each other, so a
+    // shared mistake in the mapping cannot cancel itself out.
+    struct Path {
+        const char* tag;
+        int simd;
+    };
+    for (auto&& path : { Path { "axismap", 0 }, Path { "simd", 1 } }) {
+        ImageBuf candidate(dstspec);
+        OIIO::attribute("enable_resample_axis_map", 1);
+        OIIO::attribute("enable_resample_simd", path.simd);
+        ok &= ImageBufAlgo::resample(candidate, src, interpolate);
+        OIIO::attribute("enable_resample_simd", 1);
+        if (!ok)
+            break;
+        if (memcmp(candidate.localpixels(), reference.localpixels(),
+                   dstspec.image_bytes())
+            == 0)
+            continue;
         auto cr = ImageBufAlgo::compare(candidate, reference, 0.0f, 0.0f);
-        Strutil::print("    interp={} {}x{} nch={} type={}: maxerror={:g} "
-                       "({} of {} values differ)\n",
-                       int(interpolate), dstspec.width, dstspec.height,
-                       dstspec.nchannels, dstspec.format, cr.maxerror,
-                       cr.nfail,
+        Strutil::print("    [{}] interp={} {}x{} nch={} type={}: "
+                       "maxerror={:g} ({} of {} values differ)\n",
+                       path.tag, int(interpolate), dstspec.width,
+                       dstspec.height, dstspec.nchannels, dstspec.format,
+                       cr.maxerror, cr.nfail,
                        size_t(dstspec.width) * dstspec.height
                            * dstspec.nchannels);
         ok = false;
@@ -968,15 +980,21 @@ test_resample_variants()
     struct Variant {
         const char* tag;
         int axismap;
+        int simd;
+        int hwy;
     };
-    // Highway is pinned off throughout: it services the interpolating case
-    // when it is on, and this is meant to time the tables against the
-    // per-pixel path they replaced, not against a third implementation.
-    const Variant variants[] = { { "scalar ", 0 }, { "axismap", 1 } };
+    // scalar = none of them; axismap = the scalar tables; simd = their SSE2
+    // four channel specialization; hwy = Highway, which needs the axis map out
+    // of the way for the dispatch to reach it.
+    const Variant variants[] = { { "scalar ", 0, 0, 0 },
+                                 { "axismap", 1, 0, 0 },
+                                 { "simd   ", 1, 1, 0 },
+                                 { "hwy    ", 0, 0, 1 } };
 
-    OIIO::attribute("enable_hwy", 0);
     for (auto&& v : variants) {
         OIIO::attribute("enable_resample_axis_map", v.axismap);
+        OIIO::attribute("enable_resample_simd", v.simd);
+        OIIO::attribute("enable_hwy", v.hwy);
         for (int interp = 0; interp <= 1; ++interp) {
             bool in = interp != 0;
             bench(Strutil::fmt::format("  [{}] HD->1024x512 u8->u8  interp={}",
@@ -997,6 +1015,7 @@ test_resample_variants()
     }
 
     OIIO::attribute("enable_resample_axis_map", prev_map);
+    OIIO::attribute("enable_resample_simd", 1);
     OIIO::attribute("enable_hwy", prev_hwy);
 }
 

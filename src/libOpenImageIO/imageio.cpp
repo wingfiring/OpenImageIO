@@ -65,6 +65,10 @@ int enable_hwy = 0;  // Not enabled at build time
 // benchmark run can time it against the per-pixel path it replaced.
 int enable_resample_axis_map = Strutil::stoi(
     Sysutil::getenv("OPENIMAGEIO_ENABLE_RESAMPLE_AXIS_MAP", "1"));
+// Selects the SSE2 four channel specialization of that path. Separate from the
+// flag above because it is a specialization of it, not an alternative to it.
+int enable_resample_simd = Strutil::stoi(
+    Sysutil::getenv("OPENIMAGEIO_ENABLE_RESAMPLE_SIMD", "1"));
 int limit_channels(1024);
 int limit_imagesize_MB(std::min(32 * 1024,
                                 int(Sysutil::physical_memory() >> 20)));
@@ -432,6 +436,10 @@ attribute(string_view name, TypeDesc type, const void* val)
         enable_resample_axis_map = *(const int*)val;
         return true;
     }
+    if (name == "enable_resample_simd" && type == TypeInt) {
+        enable_resample_simd = *(const int*)val;
+        return true;
+    }
     if (name == "limits:channels" && type == TypeInt) {
         limit_channels = *(const int*)val;
         return true;
@@ -656,6 +664,10 @@ getattribute(string_view name, TypeDesc type, void* val)
     }
     if (name == "enable_resample_axis_map" && type == TypeInt) {
         *(int*)val = enable_resample_axis_map;
+        return true;
+    }
+    if (name == "enable_resample_simd" && type == TypeInt) {
+        *(int*)val = enable_resample_simd;
         return true;
     }
     if (name == "oiio:print_uncaught_errors" && type == TypeInt) {

@@ -3867,6 +3867,12 @@ OIIO_API std::string geterror(bool clear = true);
 ///    it to zero falls back to evaluating the mapping per pixel, which is
 ///    slower but is retained so the two can be compared directly.
 ///
+/// - `int enable_resample_simd' (1)
+///
+///    If nonzero, four channel images taking the axis-map path above use an
+///    SSE2 specialization of it. Has no effect where
+///    `enable_resample_axis_map` is zero, or on platforms without SSE2.
+///
 /// - `string plugin_searchpath`
 ///
 ///    Colon-separated (or semicolon-separated) list of directories to search

@@ -26,6 +26,19 @@
 #    include "imagebufalgo_hwy_pvt.h"
 #endif
 
+// SSE2 is the baseline on x86-64, so the vector resample path below needs no
+// runtime dispatch there. It is written against the intrinsics directly rather
+// than simd.h because it wants exact control over the instruction sequence:
+// the results have to match convert_type() and bilerp() bit for bit.
+#if defined(__SSE2__) || defined(_M_X64) \
+    || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#    define OIIO_RESAMPLE_SSE2 1
+#    include <emmintrin.h>
+#    include <xmmintrin.h>
+#else
+#    define OIIO_RESAMPLE_SSE2 0
+#endif
+
 OIIO_NAMESPACE_3_1_BEGIN
 
 
@@ -1518,6 +1531,198 @@ resample_bilinear(ImageBuf& dst, const ImageBuf& src, ROI roi, int nthreads)
 
 
 
+#if OIIO_RESAMPLE_SSE2
+
+// A four channel pixel is exactly one __m128, which is what makes this worth
+// a separate path: the four bilinear taps, the weighting, and the conversion
+// to and from float each become one instruction per pixel instead of one per
+// channel. Every operation below is the one convert_type() and bilerp()
+// perform, in the same order, so the output stays bit-identical to the scalar
+// path -- an approximate reciprocal or an FMA here would shift results.
+
+// Source types with no vector conversion (half, and the signed and 32 bit
+// integer instantiations) still get the vector arithmetic; only their
+// unpacking stays scalar.
+template<typename S>
+static OIIO_FORCEINLINE __m128
+simd_load_rgba(const S* p)
+{
+    OIIO_ALIGN(16)
+    float t[4] = { convert_type<S, float>(p[0]), convert_type<S, float>(p[1]),
+                   convert_type<S, float>(p[2]), convert_type<S, float>(p[3]) };
+    return _mm_load_ps(t);
+}
+
+static OIIO_FORCEINLINE __m128
+simd_load_rgba(const float* p)
+{ return _mm_loadu_ps(p); }
+
+static OIIO_FORCEINLINE __m128
+simd_load_rgba(const uint8_t* p)
+{
+    int32_t packed;
+    memcpy(&packed, p, sizeof(packed));
+    __m128i z = _mm_setzero_si128();
+    __m128i v
+        = _mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(packed), z),
+                             z);
+    return _mm_mul_ps(_mm_cvtepi32_ps(v), _mm_set1_ps(1.0f / 255.0f));
+}
+
+static OIIO_FORCEINLINE __m128
+simd_load_rgba(const uint16_t* p)
+{
+    __m128i v = _mm_unpacklo_epi16(_mm_loadl_epi64((const __m128i*)p),
+                                   _mm_setzero_si128());
+    return _mm_mul_ps(_mm_cvtepi32_ps(v), _mm_set1_ps(1.0f / 65535.0f));
+}
+
+
+template<typename D>
+static OIIO_FORCEINLINE void
+simd_store_rgba(D* p, __m128 v)
+{
+    OIIO_ALIGN(16) float t[4];
+    _mm_store_ps(t, v);
+    for (int c = 0; c < 4; ++c)
+        p[c] = convert_type<float, D>(t[c]);
+}
+
+static OIIO_FORCEINLINE void
+simd_store_rgba(float* p, __m128 v)
+{ _mm_storeu_ps(p, v); }
+
+// scaled_conversion() scales, biases by 0.5, clamps, then casts; the cast
+// truncates, which is what _mm_cvttps_epi32 does, so the rounding matches.
+static OIIO_FORCEINLINE void
+simd_store_rgba(uint8_t* p, __m128 v)
+{
+    __m128 s = _mm_add_ps(_mm_mul_ps(v, _mm_set1_ps(255.0f)),
+                          _mm_set1_ps(0.5f));
+    s        = _mm_min_ps(_mm_max_ps(s, _mm_setzero_ps()), _mm_set1_ps(255.0f));
+    __m128i i   = _mm_cvttps_epi32(s);
+    i           = _mm_packs_epi32(i, i);
+    i           = _mm_packus_epi16(i, i);
+    int32_t out = _mm_cvtsi128_si32(i);
+    memcpy(p, &out, sizeof(out));
+}
+
+
+// The vector paths write through a raw destination pointer, so they need the
+// same guarantees from dst that axis_map_usable() asks of src, plus the four
+// channel shape the packing assumes.
+template<typename DSTTYPE>
+static bool
+simd_rgba_usable(const ImageBuf& src, const ImageBuf& dst, const ROI& roi)
+{
+    return dst.localpixels() && dst.contiguous_scanline()
+           && dst.spec().format.basetype == BaseTypeFromC<DSTTYPE>::value
+           && dst.spec().depth == 1 && dst.nchannels() == 4
+           && src.nchannels() == 4 && roi.chbegin == 0 && roi.chend == 4;
+}
+
+
+template<typename DSTTYPE, typename SRCTYPE>
+static bool
+resample_nearest_simd(ImageBuf& dst, const ImageBuf& src, ROI roi, int nthreads)
+{
+    const ImageSpec& srcspec(src.spec());
+    const ImageSpec& dstspec(dst.spec());
+    AxisMap xmap = build_axis_map(roi.xbegin, roi.xend, float(dstspec.full_x),
+                                  float(dstspec.full_width),
+                                  float(srcspec.full_x),
+                                  float(srcspec.full_width), srcspec.x,
+                                  srcspec.x + srcspec.width, 4);
+    AxisMap ymap
+        = build_axis_map(roi.ybegin, roi.yend, float(dstspec.full_y),
+                         float(dstspec.full_height), float(srcspec.full_y),
+                         float(srcspec.full_height), srcspec.y,
+                         srcspec.y + srcspec.height, srcspec.width * 4);
+
+    const SRCTYPE* srcpixels = (const SRCTYPE*)src.localpixels();
+    DSTTYPE* dstpixels       = (DSTTYPE*)dst.localpixels();
+    int dst_ystride          = dstspec.width * 4;
+
+    ImageBufAlgo::parallel_image(roi, nthreads, [&](ROI roi) {
+        const __m128 black = _mm_setzero_ps();
+        for (int y = roi.ybegin; y < roi.yend; ++y) {
+            bool row_inside       = y >= ymap.begin && y < ymap.end;
+            const SRCTYPE* srcrow = row_inside
+                                        ? srcpixels + ymap.pos[y - ymap.begin]
+                                        : nullptr;
+            int inside_begin      = row_inside ? xmap.begin : roi.xend;
+            int inside_end        = row_inside ? xmap.end : roi.xend;
+            DSTTYPE* out = dstpixels + size_t(y - dstspec.y) * dst_ystride
+                           + size_t(roi.xbegin - dstspec.x) * 4;
+            int x        = roi.xbegin;
+            for (; x < inside_begin; ++x, out += 4)
+                simd_store_rgba(out, black);
+            for (; x < inside_end; ++x, out += 4)
+                simd_store_rgba(out, simd_load_rgba(
+                                         srcrow + xmap.pos[x - xmap.begin]));
+            for (; x < roi.xend; ++x, out += 4)
+                simd_store_rgba(out, black);
+        }
+    });
+    return true;
+}
+
+
+template<typename DSTTYPE, typename SRCTYPE>
+static bool
+resample_bilinear_simd(ImageBuf& dst, const ImageBuf& src, ROI roi,
+                       int nthreads)
+{
+    const ImageSpec& srcspec(src.spec());
+    const ImageSpec& dstspec(dst.spec());
+    AxisMap xmap = build_axis_map_bilinear(roi.xbegin, roi.xend,
+                                           float(dstspec.full_x),
+                                           float(dstspec.full_width),
+                                           float(srcspec.full_x),
+                                           float(srcspec.full_width), srcspec.x,
+                                           srcspec.x + srcspec.width, 4);
+    AxisMap ymap = build_axis_map_bilinear(
+        roi.ybegin, roi.yend, float(dstspec.full_y), float(dstspec.full_height),
+        float(srcspec.full_y), float(srcspec.full_height), srcspec.y,
+        srcspec.y + srcspec.height, srcspec.width * 4);
+
+    const SRCTYPE* srcpixels = (const SRCTYPE*)src.localpixels();
+    DSTTYPE* dstpixels       = (DSTTYPE*)dst.localpixels();
+    int dst_ystride          = dstspec.width * 4;
+
+    ImageBufAlgo::parallel_image(roi, nthreads, [&](ROI roi) {
+        for (int y = roi.ybegin; y < roi.yend; ++y) {
+            size_t yi             = size_t(y - ymap.begin);
+            const SRCTYPE* rowtop = srcpixels + ymap.pos[yi];
+            const SRCTYPE* rowbot = srcpixels + ymap.pos1[yi];
+            __m128 vt             = _mm_set1_ps(ymap.frac[yi]);
+            __m128 vt1            = _mm_set1_ps(1.0f - ymap.frac[yi]);
+            DSTTYPE* out = dstpixels + size_t(y - dstspec.y) * dst_ystride
+                           + size_t(roi.xbegin - dstspec.x) * 4;
+            for (int x = roi.xbegin; x < roi.xend; ++x, out += 4) {
+                size_t xi  = size_t(x - xmap.begin);
+                __m128 vs  = _mm_set1_ps(xmap.frac[xi]);
+                __m128 vs1 = _mm_set1_ps(1.0f - xmap.frac[xi]);
+                int xl     = xmap.pos[xi];
+                int xr     = xmap.pos1[xi];
+                __m128 top
+                    = _mm_add_ps(_mm_mul_ps(simd_load_rgba(rowtop + xl), vs1),
+                                 _mm_mul_ps(simd_load_rgba(rowtop + xr), vs));
+                __m128 bot
+                    = _mm_add_ps(_mm_mul_ps(simd_load_rgba(rowbot + xl), vs1),
+                                 _mm_mul_ps(simd_load_rgba(rowbot + xr), vs));
+                simd_store_rgba(out, _mm_add_ps(_mm_mul_ps(vt1, top),
+                                                _mm_mul_ps(vt, bot)));
+            }
+        }
+    });
+    return true;
+}
+
+#endif /* OIIO_RESAMPLE_SSE2 */
+
+
+
 #if OIIO_USE_HWY
 template<typename DSTTYPE, typename SRCTYPE>
 static bool
@@ -1692,6 +1897,15 @@ resample_(ImageBuf& dst, const ImageBuf& src, bool interpolate, ROI roi,
     if (OIIO::pvt::enable_resample_axis_map
         && axis_map_usable<SRCTYPE>(src, roi)
         && (!interpolate || data_window_is_full_window(src.spec()))) {
+#if OIIO_RESAMPLE_SSE2
+        if (OIIO::pvt::enable_resample_simd
+            && simd_rgba_usable<DSTTYPE>(src, dst, roi))
+            return interpolate
+                       ? resample_bilinear_simd<DSTTYPE, SRCTYPE>(dst, src, roi,
+                                                                  nthreads)
+                       : resample_nearest_simd<DSTTYPE, SRCTYPE>(dst, src, roi,
+                                                                 nthreads);
+#endif
         return interpolate ? resample_bilinear<DSTTYPE, SRCTYPE>(dst, src, roi,
                                                                  nthreads)
                            : resample_nearest<DSTTYPE, SRCTYPE>(dst, src, roi,
