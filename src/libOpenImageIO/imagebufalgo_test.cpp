@@ -837,10 +837,13 @@ test_resample_nearest_equivalence()
     // destinations are deliberately larger than the size cutoff in
     // axis_map_usable(), or both sides of the comparison would take the same
     // fallback and the test would prove nothing.
+    // The channel counts select between the vector kernels: below four the
+    // lane holds a pixel, at four and above it holds a channel, and five is
+    // the case where the last block of four has to overlap the one before it.
     for (auto type : { TypeUInt8, TypeUInt16, TypeHalf, TypeFloat }) {
-        for (int nchans : { 1, 3, 4 }) {
-            float top[4]    = { 0.1f, 0.2f, 0.3f, 0.4f };
-            float bottom[4] = { 0.9f, 0.8f, 0.7f, 0.6f };
+        for (int nchans : { 1, 2, 3, 4, 5 }) {
+            float top[5]    = { 0.1f, 0.2f, 0.3f, 0.4f, 0.5f };
+            float bottom[5] = { 0.9f, 0.8f, 0.7f, 0.6f, 0.55f };
             ImageBuf src(ImageSpec(301, 203, nchans, type));
             ImageBufAlgo::fill(src, cspan<float>(top, nchans),
                                cspan<float>(bottom, nchans));
@@ -911,13 +914,8 @@ test_resample_nearest_equivalence()
         ImageBuf padded(padspec, mem.get(), xstride, ystride);
         ImageBufAlgo::paste(padded, padspec.x, padspec.y, padspec.z, 0, packed);
 
-        // Highway is pinned off: resample_hwy() derives its row pointers
-        // from ImageSpec::scanline_bytes(), which is the packed size rather
-        // than the buffer's stride, so it fails this case for reasons that
-        // have nothing to do with the tables under test.
-        int prev_hwy = 0;
-        OIIO::getattribute("enable_hwy", prev_hwy);
-        OIIO::attribute("enable_hwy", 0);
+        // Whichever path serves the two sources, it must serve them the same
+        // way. resample_hwy() had the same stride bug and this catches it.
         for (bool interp : { false, true }) {
             ImageSpec dstspec(53, 79, 4, TypeFloat);
             ImageBuf from_packed(dstspec), from_padded(dstspec);
@@ -930,7 +928,6 @@ test_resample_nearest_equivalence()
                                     dstspec.image_bytes()),
                              0);
         }
-        OIIO::attribute("enable_hwy", prev_hwy);
     }
 
     OIIO::attribute("enable_resample_axis_map", prev);
@@ -1017,6 +1014,20 @@ test_resample_variants()
     ImageBuf dst_u16(ImageSpec(1024, 512, 4, TypeUInt16));
     ImageBuf dst_f(ImageSpec(1024, 512, 4, TypeFloat));
 
+    // Channel counts other than four, which is where the vector path's
+    // one-pixel-per-vector packing stops applying and Highway's
+    // channel-as-outer-loop does not.
+    const int chcounts[] = { 1, 2, 3, 5 };
+    std::vector<ImageBuf> src_ch, dst_ch;
+    for (int nc : chcounts) {
+        src_ch.emplace_back(ImageSpec(1920, 1080, nc, TypeUInt8));
+        dst_ch.emplace_back(ImageSpec(1024, 512, nc, TypeUInt8));
+        std::vector<float> vals(nc, 0.0f);
+        for (int c = 0; c < nc; ++c)
+            vals[size_t(c)] = float(c + 1) / float(nc + 1);
+        ImageBufAlgo::fill(src_ch.back(), vals);
+    }
+
     struct Variant {
         const char* tag;
         int axismap;
@@ -1052,6 +1063,10 @@ test_resample_variants()
                                        v.tag, interp),
                   [&]() { ImageBufAlgo::resample(dst_u8, src_f, in); });
         }
+        for (size_t i = 0; i < src_ch.size(); ++i)
+            bench(Strutil::fmt::format("  [{}] HD->1024x512 u8->u8  nchans={}",
+                                       v.tag, chcounts[i]),
+                  [&]() { ImageBufAlgo::resample(dst_ch[i], src_ch[i], true); });
     }
 
     OIIO::attribute("enable_resample_axis_map", prev_map);

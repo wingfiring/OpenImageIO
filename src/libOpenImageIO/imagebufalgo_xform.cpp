@@ -1534,10 +1534,25 @@ resample_bilinear(ImageBuf& dst, const ImageBuf& src, ROI roi, int nthreads)
 
 #if OIIO_RESAMPLE_HWY
 
-// A four channel pixel is exactly one 4-lane vector, which is what makes this
-// worth a separate path: the four bilinear taps, the weighting, and the
-// conversion to and from float each become one operation per pixel instead of
-// one per channel.
+// The vector lane holds a channel rather than a pixel, so four channels are
+// one vector and the four bilinear taps, the weighting, and the conversion to
+// and from float each become one operation per four channels instead of one
+// per channel.
+//
+// The channel is the lane, not the pixel, because consecutive destination
+// pixels read scattered source columns: putting pixels in lanes would need a
+// gather, which is exactly the arithmetic the axis maps exist to avoid.
+//
+// Every access is full width. A pixel whose channel count is not a multiple
+// of four is covered by letting the last block *overlap* the one before it
+// rather than by narrowing it: the overlapping channels are recomputed from
+// the same inputs, so they land on the same values, and that costs far less
+// than a partial access. A short block has to be staged through the stack --
+// Highway's LoadN/StoreN are branchy, and hand rolling it is worse, because a
+// one byte store feeding a four byte load is a store-forwarding stall. Either
+// way it measured several times the cost of the whole full width block. It is
+// also why this path declines fewer than four channels outright: with nothing
+// to overlap against, every access there would be a short one.
 //
 // Every operation below is the one convert_type() and bilerp() perform, in the
 // same order. In particular the weighting deliberately does not use MulAdd:
@@ -1555,7 +1570,7 @@ using RVec = hn::Vec<RF32>;
 // unpacking stays scalar.
 template<typename S>
 static OIIO_FORCEINLINE RVec
-simd_load_rgba(const S* p)
+simd_load4(const S* p)
 {
     OIIO_ALIGN(16)
     float t[4] = { convert_type<S, float>(p[0]), convert_type<S, float>(p[1]),
@@ -1564,13 +1579,13 @@ simd_load_rgba(const S* p)
 }
 
 static OIIO_FORCEINLINE RVec
-simd_load_rgba(const float* p)
+simd_load4(const float* p)
 {
     return hn::LoadU(RF32(), p);
 }
 
 static OIIO_FORCEINLINE RVec
-simd_load_rgba(const uint8_t* p)
+simd_load4(const uint8_t* p)
 {
     auto v = hn::PromoteTo(RU32(), hn::LoadU(RU8(), p));
     return hn::Mul(hn::ConvertTo(RF32(), hn::BitCast(RI32(), v)),
@@ -1578,7 +1593,7 @@ simd_load_rgba(const uint8_t* p)
 }
 
 static OIIO_FORCEINLINE RVec
-simd_load_rgba(const uint16_t* p)
+simd_load4(const uint16_t* p)
 {
     auto v = hn::PromoteTo(RU32(), hn::LoadU(RU16(), p));
     return hn::Mul(hn::ConvertTo(RF32(), hn::BitCast(RI32(), v)),
@@ -1588,7 +1603,7 @@ simd_load_rgba(const uint16_t* p)
 
 template<typename D>
 static OIIO_FORCEINLINE void
-simd_store_rgba(D* p, RVec v)
+simd_store4(D* p, RVec v)
 {
     OIIO_ALIGN(16) float t[4];
     hn::Store(v, RF32(), t);
@@ -1597,7 +1612,7 @@ simd_store_rgba(D* p, RVec v)
 }
 
 static OIIO_FORCEINLINE void
-simd_store_rgba(float* p, RVec v)
+simd_store4(float* p, RVec v)
 {
     hn::StoreU(v, RF32(), p);
 }
@@ -1605,45 +1620,157 @@ simd_store_rgba(float* p, RVec v)
 // scaled_conversion() scales, biases by 0.5, clamps, then casts; the cast
 // truncates, which is what ConvertTo() does for float to integer, so the
 // rounding matches.
-static OIIO_FORCEINLINE void
-simd_store_rgba(uint8_t* p, RVec v)
+static OIIO_FORCEINLINE hn::Vec<RU8>
+simd_to_u8(RVec v)
 {
     const RF32 df;
     auto s = hn::Add(hn::Mul(v, hn::Set(df, 255.0f)), hn::Set(df, 0.5f));
     s      = hn::Min(hn::Max(s, hn::Zero(df)), hn::Set(df, 255.0f));
-    hn::StoreU(hn::U8FromU32(hn::BitCast(RU32(), hn::ConvertTo(RI32(), s))),
-               RU8(), p);
+    return hn::U8FromU32(hn::BitCast(RU32(), hn::ConvertTo(RI32(), s)));
+}
+
+static OIIO_FORCEINLINE hn::Vec<RU16>
+simd_to_u16(RVec v)
+{
+    const RF32 df;
+    auto s = hn::Add(hn::Mul(v, hn::Set(df, 65535.0f)), hn::Set(df, 0.5f));
+    s      = hn::Min(hn::Max(s, hn::Zero(df)), hn::Set(df, 65535.0f));
+    return hn::DemoteTo(RU16(), hn::BitCast(RU32(), hn::ConvertTo(RI32(), s)));
+}
+
+static OIIO_FORCEINLINE void
+simd_store4(uint8_t* p, RVec v)
+{ hn::StoreU(simd_to_u8(v), RU8(), p); }
+
+static OIIO_FORCEINLINE void
+simd_store4(uint16_t* p, RVec v)
+{ hn::StoreU(simd_to_u16(v), RU16(), p); }
+
+
+// Writes NC vectors of consecutive destination pixels back out in pixel
+// order. This is the other half of the pixels-as-lanes layout: the gather has
+// to be scalar, but the interleave on the way out does not.
+template<int NC, typename D>
+static OIIO_FORCEINLINE void
+simd_store_px(D* p, RVec v0, RVec v1, RVec v2)
+{
+    OIIO_ALIGN(16) float t[3][4];
+    hn::Store(v0, RF32(), t[0]);
+    if constexpr (NC > 1)
+        hn::Store(v1, RF32(), t[1]);
+    if constexpr (NC > 2)
+        hn::Store(v2, RF32(), t[2]);
+    for (int i = 0; i < 4; ++i)
+        for (int c = 0; c < NC; ++c)
+            p[i * NC + c] = convert_type<float, D>(t[c][i]);
+}
+
+template<int NC>
+static OIIO_FORCEINLINE void
+simd_store_px(float* p, RVec v0, RVec v1, RVec v2)
+{
+    if constexpr (NC == 1)
+        hn::StoreU(v0, RF32(), p);
+    else if constexpr (NC == 2)
+        hn::StoreInterleaved2(v0, v1, RF32(), p);
+    else
+        hn::StoreInterleaved3(v0, v1, v2, RF32(), p);
+}
+
+// Four lanes of a narrow type is a *partial* vector -- four of the sixteen
+// byte lanes, four of the eight 16-bit ones -- and Highway serves
+// StoreInterleaved2/3 for a partial vector from its slow general case. The
+// conversion is the part worth vectorizing; interleaving the converted
+// elements by hand costs about the same as StoreInterleaved2 and is a third
+// off StoreInterleaved3, so both go through the same code below.
+template<int NC>
+static OIIO_FORCEINLINE void
+simd_store_px(uint8_t* p, RVec v0, RVec v1, RVec v2)
+{
+    if constexpr (NC == 1) {
+        hn::StoreU(simd_to_u8(v0), RU8(), p);
+        return;
+    }
+    OIIO_ALIGN(4) uint8_t t[3][4];
+    hn::StoreU(simd_to_u8(v0), RU8(), t[0]);
+    hn::StoreU(simd_to_u8(v1), RU8(), t[1]);
+    if constexpr (NC > 2)
+        hn::StoreU(simd_to_u8(v2), RU8(), t[2]);
+    for (int i = 0; i < 4; ++i)
+        for (int c = 0; c < NC; ++c)
+            p[i * NC + c] = t[c][i];
+}
+
+template<int NC>
+static OIIO_FORCEINLINE void
+simd_store_px(uint16_t* p, RVec v0, RVec v1, RVec v2)
+{
+    if constexpr (NC == 1) {
+        hn::StoreU(simd_to_u16(v0), RU16(), p);
+        return;
+    }
+    OIIO_ALIGN(8) uint16_t t[3][4];
+    hn::StoreU(simd_to_u16(v0), RU16(), t[0]);
+    hn::StoreU(simd_to_u16(v1), RU16(), t[1]);
+    if constexpr (NC > 2)
+        hn::StoreU(simd_to_u16(v2), RU16(), t[2]);
+    for (int i = 0; i < 4; ++i)
+        for (int c = 0; c < NC; ++c)
+            p[i * NC + c] = t[c][i];
+}
+
+
+// Advances to the next block of four channels, backing the final one up to
+// end on the last channel so that it stays full width. Returns true once the
+// block just processed was the last. Requires nc >= 4.
+static OIIO_FORCEINLINE bool
+simd_next_chan_block(int& c, int nc)
+{
+    if (c + 4 >= nc)
+        return true;
+    c = std::min(c + 4, nc - 4);
+    return false;
 }
 
 
 // The vector paths write through a raw destination pointer, so they need the
-// same guarantees from dst that axis_map_usable() asks of src, plus the four
-// channel shape the packing assumes.
+// same guarantees from dst that axis_map_usable() asks of src, plus whole
+// pixels: the store writes a pixel at a time, so a channel subrange would
+// clobber the channels either side of it.
 template<typename DSTTYPE>
 static bool
-simd_rgba_usable(const ImageBuf& src, const ImageBuf& dst, const ROI& roi)
+simd_chans_usable(const ImageBuf& src, const ImageBuf& dst, bool interpolate,
+                  const ROI& roi)
 {
     return dst.localpixels() && dst.contiguous_scanline()
            && dst.spec().format.basetype == BaseTypeFromC<DSTTYPE>::value
-           && dst.spec().depth == 1 && dst.nchannels() == 4
-           && src.nchannels() == 4 && roi.chbegin == 0 && roi.chend == 4
+           && dst.spec().depth == 1 && dst.nchannels() == src.nchannels()
+           && roi.chbegin == 0
+           && roi.chend == dst.nchannels()
+           // Below four channels only the interpolating kernel has a vector
+           // form worth taking: nearest is a copy, and the scalar tables
+           // already do that about as fast as it can be done.
+           && (dst.nchannels() >= 4 || interpolate)
            && dst.scanline_stride() % stride_t(sizeof(DSTTYPE)) == 0;
 }
 
 
-template<typename DSTTYPE, typename SRCTYPE>
+// NC is the channel count when it is known at compile time, or 0 to take it
+// from the source at run time.
+template<typename DSTTYPE, typename SRCTYPE, int NC>
 static bool
 resample_nearest_simd(ImageBuf& dst, const ImageBuf& src, ROI roi, int nthreads)
 {
     const ImageSpec& srcspec(src.spec());
     const ImageSpec& dstspec(dst.spec());
+    const int nc    = NC ? NC : srcspec.nchannels;
     int src_ystride = int(src.scanline_stride() / stride_t(sizeof(SRCTYPE)));
     int dst_ystride = int(dst.scanline_stride() / stride_t(sizeof(DSTTYPE)));
     AxisMap xmap = build_axis_map(roi.xbegin, roi.xend, float(dstspec.full_x),
                                   float(dstspec.full_width),
                                   float(srcspec.full_x),
                                   float(srcspec.full_width), srcspec.x,
-                                  srcspec.x + srcspec.width, 4);
+                                  srcspec.x + srcspec.width, nc);
     AxisMap ymap
         = build_axis_map(roi.ybegin, roi.yend, float(dstspec.full_y),
                          float(dstspec.full_height), float(srcspec.full_y),
@@ -1654,6 +1781,10 @@ resample_nearest_simd(ImageBuf& dst, const ImageBuf& src, ROI roi, int nthreads)
     DSTTYPE* dstpixels       = (DSTTYPE*)dst.localpixels();
 
     ImageBufAlgo::parallel_image(roi, nthreads, [&](ROI roi) {
+        // Shadowed rather than captured so that a compile-time channel count
+        // stays compile-time inside the task, which is what collapses the
+        // block loop and folds the short-block test out of the accessors.
+        const int nc     = NC ? NC : srcspec.nchannels;
         const RVec black = hn::Zero(RF32());
         for (int y = roi.ybegin; y < roi.yend; ++y) {
             bool row_inside       = y >= ymap.begin && y < ymap.end;
@@ -1663,25 +1794,105 @@ resample_nearest_simd(ImageBuf& dst, const ImageBuf& src, ROI roi, int nthreads)
             int inside_begin      = row_inside ? xmap.begin : roi.xend;
             int inside_end        = row_inside ? xmap.end : roi.xend;
             DSTTYPE* out = dstpixels + size_t(y - dstspec.y) * dst_ystride
-                           + size_t(roi.xbegin - dstspec.x) * 4;
+                           + size_t(roi.xbegin - dstspec.x) * nc;
             int x        = roi.xbegin;
-            for (; x < inside_begin; ++x, out += 4)
-                simd_store_rgba(out, black);
-            for (; x < inside_end; ++x, out += 4)
-                simd_store_rgba(out, simd_load_rgba(
-                                         srcrow + xmap.pos[x - xmap.begin]));
-            for (; x < roi.xend; ++x, out += 4)
-                simd_store_rgba(out, black);
+            for (; x < inside_begin; ++x, out += nc)
+                for (int c = 0;;) {
+                    simd_store4(out + c, black);
+                    if (simd_next_chan_block(c, nc))
+                        break;
+                }
+            for (; x < inside_end; ++x, out += nc) {
+                const SRCTYPE* p = srcrow + xmap.pos[x - xmap.begin];
+                for (int c = 0;;) {
+                    simd_store4(out + c, simd_load4(p + c));
+                    if (simd_next_chan_block(c, nc))
+                        break;
+                }
+            }
+            for (; x < roi.xend; ++x, out += nc)
+                for (int c = 0;;) {
+                    simd_store4(out + c, black);
+                    if (simd_next_chan_block(c, nc))
+                        break;
+                }
         }
     });
     return true;
 }
 
 
-template<typename DSTTYPE, typename SRCTYPE>
+template<typename DSTTYPE, typename SRCTYPE, int NC>
 static bool
 resample_bilinear_simd(ImageBuf& dst, const ImageBuf& src, ROI roi,
                        int nthreads)
+{
+    const ImageSpec& srcspec(src.spec());
+    const ImageSpec& dstspec(dst.spec());
+    const int nc    = NC ? NC : srcspec.nchannels;
+    int src_ystride = int(src.scanline_stride() / stride_t(sizeof(SRCTYPE)));
+    int dst_ystride = int(dst.scanline_stride() / stride_t(sizeof(DSTTYPE)));
+    AxisMap xmap = build_axis_map_bilinear(roi.xbegin, roi.xend,
+                                           float(dstspec.full_x),
+                                           float(dstspec.full_width),
+                                           float(srcspec.full_x),
+                                           float(srcspec.full_width), srcspec.x,
+                                           srcspec.x + srcspec.width, nc);
+    AxisMap ymap = build_axis_map_bilinear(
+        roi.ybegin, roi.yend, float(dstspec.full_y), float(dstspec.full_height),
+        float(srcspec.full_y), float(srcspec.full_height), srcspec.y,
+        srcspec.y + srcspec.height, src_ystride);
+
+    const SRCTYPE* srcpixels = (const SRCTYPE*)src.localpixels();
+    DSTTYPE* dstpixels       = (DSTTYPE*)dst.localpixels();
+
+    ImageBufAlgo::parallel_image(roi, nthreads, [&](ROI roi) {
+        // See resample_nearest_simd(): shadowed so a compile-time channel
+        // count survives into the task body.
+        const int nc = NC ? NC : srcspec.nchannels;
+        for (int y = roi.ybegin; y < roi.yend; ++y) {
+            size_t yi             = size_t(y - ymap.begin);
+            const SRCTYPE* rowtop = srcpixels + ymap.pos[yi];
+            const SRCTYPE* rowbot = srcpixels + ymap.pos1[yi];
+            RVec vt               = hn::Set(RF32(), ymap.frac[yi]);
+            RVec vt1              = hn::Set(RF32(), 1.0f - ymap.frac[yi]);
+            DSTTYPE* out = dstpixels + size_t(y - dstspec.y) * dst_ystride
+                           + size_t(roi.xbegin - dstspec.x) * nc;
+            for (int x = roi.xbegin; x < roi.xend; ++x, out += nc) {
+                size_t xi = size_t(x - xmap.begin);
+                RVec vs   = hn::Set(RF32(), xmap.frac[xi]);
+                RVec vs1  = hn::Set(RF32(), 1.0f - xmap.frac[xi]);
+                int xl    = xmap.pos[xi];
+                int xr    = xmap.pos1[xi];
+                for (int c = 0;;) {
+                    RVec top
+                        = hn::Add(hn::Mul(simd_load4(rowtop + xl + c), vs1),
+                                  hn::Mul(simd_load4(rowtop + xr + c), vs));
+                    RVec bot
+                        = hn::Add(hn::Mul(simd_load4(rowbot + xl + c), vs1),
+                                  hn::Mul(simd_load4(rowbot + xr + c), vs));
+                    simd_store4(out + c,
+                                hn::Add(hn::Mul(vt1, top), hn::Mul(vt, bot)));
+                    if (simd_next_chan_block(c, nc))
+                        break;
+                }
+            }
+        }
+    });
+    return true;
+}
+
+
+// Below four channels a pixel cannot fill a vector, so the lane holds a
+// destination pixel instead and the channel becomes the outer loop. The taps
+// then have to be gathered one at a time, which is the cost this layout pays
+// and the channel-as-lane layout does not -- but every lane is occupied, the
+// conversion and the weighting stay full width, and the axis map still
+// supplies the source offsets outright, so nothing recomputes a coordinate.
+template<typename DSTTYPE, typename SRCTYPE, int NC>
+static bool
+resample_bilinear_simd_px(ImageBuf& dst, const ImageBuf& src, ROI roi,
+                          int nthreads)
 {
     const ImageSpec& srcspec(src.spec());
     const ImageSpec& dstspec(dst.spec());
@@ -1692,7 +1903,7 @@ resample_bilinear_simd(ImageBuf& dst, const ImageBuf& src, ROI roi,
                                            float(dstspec.full_width),
                                            float(srcspec.full_x),
                                            float(srcspec.full_width), srcspec.x,
-                                           srcspec.x + srcspec.width, 4);
+                                           srcspec.x + srcspec.width, NC);
     AxisMap ymap = build_axis_map_bilinear(
         roi.ybegin, roi.yend, float(dstspec.full_y), float(dstspec.full_height),
         float(srcspec.full_y), float(srcspec.full_height), srcspec.y,
@@ -1706,26 +1917,92 @@ resample_bilinear_simd(ImageBuf& dst, const ImageBuf& src, ROI roi,
             size_t yi             = size_t(y - ymap.begin);
             const SRCTYPE* rowtop = srcpixels + ymap.pos[yi];
             const SRCTYPE* rowbot = srcpixels + ymap.pos1[yi];
-            RVec vt               = hn::Set(RF32(), ymap.frac[yi]);
-            RVec vt1              = hn::Set(RF32(), 1.0f - ymap.frac[yi]);
+            float t               = ymap.frac[yi];
+            RVec vt               = hn::Set(RF32(), t);
+            RVec vt1              = hn::Set(RF32(), 1.0f - t);
             DSTTYPE* out = dstpixels + size_t(y - dstspec.y) * dst_ystride
-                           + size_t(roi.xbegin - dstspec.x) * 4;
-            for (int x = roi.xbegin; x < roi.xend; ++x, out += 4) {
+                           + size_t(roi.xbegin - dstspec.x) * NC;
+            int x        = roi.xbegin;
+            for (; x + 4 <= roi.xend; x += 4, out += 4 * NC) {
                 size_t xi = size_t(x - xmap.begin);
-                RVec vs   = hn::Set(RF32(), xmap.frac[xi]);
-                RVec vs1  = hn::Set(RF32(), 1.0f - xmap.frac[xi]);
+                RVec vs   = hn::LoadU(RF32(), &xmap.frac[xi]);
+                RVec vs1  = hn::Sub(hn::Set(RF32(), 1.0f), vs);
+                auto chan = [&](int c) -> RVec {
+                    OIIO_ALIGN(16) float a00[4], a01[4], a10[4], a11[4];
+                    for (int i = 0; i < 4; ++i) {
+                        int xl = xmap.pos[xi + size_t(i)] + c;
+                        int xr = xmap.pos1[xi + size_t(i)] + c;
+                        a00[i] = convert_type<SRCTYPE, float>(rowtop[xl]);
+                        a01[i] = convert_type<SRCTYPE, float>(rowtop[xr]);
+                        a10[i] = convert_type<SRCTYPE, float>(rowbot[xl]);
+                        a11[i] = convert_type<SRCTYPE, float>(rowbot[xr]);
+                    }
+                    RVec top = hn::Add(hn::Mul(hn::Load(RF32(), a00), vs1),
+                                       hn::Mul(hn::Load(RF32(), a01), vs));
+                    RVec bot = hn::Add(hn::Mul(hn::Load(RF32(), a10), vs1),
+                                       hn::Mul(hn::Load(RF32(), a11), vs));
+                    return hn::Add(hn::Mul(vt1, top), hn::Mul(vt, bot));
+                };
+                RVec r0 = chan(0);
+                RVec r1 = NC > 1 ? chan(1) : r0;
+                RVec r2 = NC > 2 ? chan(2) : r0;
+                simd_store_px<NC>(out, r0, r1, r2);
+            }
+            // The last few destination pixels of the row, which is scalar
+            // rather than a masked block: it is at most three pixels per row.
+            for (; x < roi.xend; ++x, out += NC) {
+                size_t xi = size_t(x - xmap.begin);
+                float s   = xmap.frac[xi];
+                float s1  = 1.0f - s;
                 int xl    = xmap.pos[xi];
                 int xr    = xmap.pos1[xi];
-                RVec top  = hn::Add(hn::Mul(simd_load_rgba(rowtop + xl), vs1),
-                                    hn::Mul(simd_load_rgba(rowtop + xr), vs));
-                RVec bot  = hn::Add(hn::Mul(simd_load_rgba(rowbot + xl), vs1),
-                                    hn::Mul(simd_load_rgba(rowbot + xr), vs));
-                simd_store_rgba(out,
-                                hn::Add(hn::Mul(vt1, top), hn::Mul(vt, bot)));
+                for (int c = 0; c < NC; ++c) {
+                    float top
+                        = convert_type<SRCTYPE, float>(rowtop[xl + c]) * s1
+                          + convert_type<SRCTYPE, float>(rowtop[xr + c]) * s;
+                    float bot
+                        = convert_type<SRCTYPE, float>(rowbot[xl + c]) * s1
+                          + convert_type<SRCTYPE, float>(rowbot[xr + c]) * s;
+                    out[c] = convert_type<float, DSTTYPE>((1.0f - t) * top
+                                                          + t * bot);
+                }
             }
         }
     });
     return true;
+}
+
+
+// Four channels is worth turning into a template argument: it collapses the
+// block loop to straight-line code, and it is far and away the common case.
+template<typename DSTTYPE, typename SRCTYPE>
+static bool
+resample_simd(ImageBuf& dst, const ImageBuf& src, bool interpolate, ROI roi,
+              int nthreads)
+{
+    switch (src.nchannels()) {
+    case 1:
+        return resample_bilinear_simd_px<DSTTYPE, SRCTYPE, 1>(dst, src, roi,
+                                                              nthreads);
+    case 2:
+        return resample_bilinear_simd_px<DSTTYPE, SRCTYPE, 2>(dst, src, roi,
+                                                              nthreads);
+    case 3:
+        return resample_bilinear_simd_px<DSTTYPE, SRCTYPE, 3>(dst, src, roi,
+                                                              nthreads);
+    case 4:
+        return interpolate
+                   ? resample_bilinear_simd<DSTTYPE, SRCTYPE, 4>(dst, src, roi,
+                                                                 nthreads)
+                   : resample_nearest_simd<DSTTYPE, SRCTYPE, 4>(dst, src, roi,
+                                                                nthreads);
+    default:
+        return interpolate
+                   ? resample_bilinear_simd<DSTTYPE, SRCTYPE, 0>(dst, src, roi,
+                                                                 nthreads)
+                   : resample_nearest_simd<DSTTYPE, SRCTYPE, 0>(dst, src, roi,
+                                                                nthreads);
+    }
 }
 
 #endif /* OIIO_RESAMPLE_HWY */
@@ -1763,8 +2040,14 @@ resample_hwy(ImageBuf& dst, const ImageBuf& src, bool interpolate, ROI roi,
         float dstpixelwidth  = 1.0f / dstfw;
         float dstpixelheight = 1.0f / dstfh;
 
-        const size_t src_scanline_bytes = srcspec.scanline_bytes();
-        const size_t dst_scanline_bytes = dstspec.scanline_bytes();
+        // LOCAL ONLY, not for upstream: HwySupports() asks for
+        // contiguous_scanline(), which permits a gap *between* rows, so the
+        // row pointers below must come from the buffer's real stride and not
+        // from the spec's packed scanline size. Without this a row padded
+        // source reads the wrong rows. Fixed here so that this path is
+        // measuring the same work the other paths measure.
+        const size_t src_scanline_bytes = size_t(src.scanline_stride());
+        const size_t dst_scanline_bytes = size_t(dst.scanline_stride());
         const size_t src_pixel_bytes    = srcspec.pixel_bytes();
         const size_t dst_pixel_bytes    = dstspec.pixel_bytes();
 
@@ -1918,12 +2201,9 @@ resample_(ImageBuf& dst, const ImageBuf& src, bool interpolate, ROI roi,
         && (!interpolate || data_window_is_full_window(src.spec()))) {
 #if OIIO_RESAMPLE_HWY
         if (OIIO::pvt::enable_resample_simd
-            && simd_rgba_usable<DSTTYPE>(src, dst, roi))
-            return interpolate
-                       ? resample_bilinear_simd<DSTTYPE, SRCTYPE>(dst, src, roi,
-                                                                  nthreads)
-                       : resample_nearest_simd<DSTTYPE, SRCTYPE>(dst, src, roi,
-                                                                 nthreads);
+            && simd_chans_usable<DSTTYPE>(src, dst, interpolate, roi))
+            return resample_simd<DSTTYPE, SRCTYPE>(dst, src, interpolate, roi,
+                                                   nthreads);
 #endif
         return interpolate ? resample_bilinear<DSTTYPE, SRCTYPE>(dst, src, roi,
                                                                  nthreads)
